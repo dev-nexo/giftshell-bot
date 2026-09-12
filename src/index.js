@@ -1,4 +1,12 @@
 import http from 'node:http';
+import {
+  closeGiftEngine,
+  getGiftCatalog,
+  giftEngineStatus,
+  isGiftEngineConfigured,
+  primeGiftEngine,
+  sendGiftFromBusiness
+} from './gifts.js';
 
 const BOT_TOKEN = process.env.BOT_TOKEN?.trim();
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET?.trim();
@@ -32,6 +40,9 @@ if (USE_WEBHOOK && !WEBHOOK_SECRET) {
 const API = `https://api.telegram.org/bot${BOT_TOKEN}`;
 const connectionCache = new Map();
 const activeConnectionByUser = new Map();
+const catalogSnapshots = new Map();
+const paymentLocks = new Set();
+const successfulPayments = new Set();
 
 let httpServer;
 let shuttingDown = false;
@@ -118,11 +129,10 @@ function rightsSummary(rights = {}) {
   const rows = [
     ['Читать сообщения', rights.can_read_messages],
     ['Отвечать', rights.can_reply],
-    ['Удалять свои сообщения бота', rights.can_delete_sent_messages],
-    ['Удалять команды пользователя', rights.can_delete_all_messages],
+    ['Удалять команды', rights.can_delete_all_messages],
     ['Смотреть Gifts и Stars', rights.can_view_gifts_and_stars],
     ['Передавать/улучшать Gifts', rights.can_transfer_and_upgrade_gifts],
-    ['Передавать Stars', rights.can_transfer_stars]
+    ['Тратить/передавать Stars', rights.can_transfer_stars]
   ];
 
   return rows
@@ -177,6 +187,14 @@ async function resolveUserConnection(userId) {
   }
 }
 
+function giftEngineLine() {
+  const status = giftEngineStatus();
+
+  return status.configured
+    ? `✅ Реальная отправка Gifts включена${status.sessionPersisted ? '' : ' (временная MTProto-сессия)'}`
+    : '⚠️ Каталог доступен, но для покупки Gifts нужны TG_API_ID и TG_API_HASH';
+}
+
 async function handleStart(message) {
   const userId = message.from?.id;
   const me = await api('getMe');
@@ -194,7 +212,7 @@ async function handleStart(message) {
         `Как подключить:\n` +
         `1. Telegram → Настройки → Автоматизация чатов\n` +
         `2. Добавь @${me.username}\n` +
-        `3. Выдай права на чтение, ответы, удаление сообщений и Gifts/Stars\n` +
+        `3. Выдай все права, особенно чтение, ответы, удаление и Gifts/Stars\n` +
         `4. Выбери нужные личные чаты\n` +
         `5. Вернись сюда и снова отправь /start`
     });
@@ -207,12 +225,15 @@ async function handleStart(message) {
       `🎁 GiftShell\n\n` +
       `✅ Автоматизация подключена.\n\n` +
       `${rightsSummary(connection.rights)}\n\n` +
-      `Команды в личных чатах начинаются с точки:\n` +
+      `${giftEngineLine()}\n\n` +
+      `Команды:\n` +
       `.help\n` +
       `.ping\n` +
       `.status\n` +
-      `.gift test\n\n` +
-      `Верная команда выполняется, после чего её сообщение удаляется из чата.`
+      `.balance\n` +
+      `.gifts\n` +
+      `.gift <номер или название>\n\n` +
+      `Сначала .gifts, потом .gift. После успешного действия команда исчезает.`
   });
 }
 
@@ -233,7 +254,7 @@ async function handleNormalMessage(message) {
     await api('sendMessage', {
       chat_id: message.chat.id,
       text: connection
-        ? `✅ Automation подключена.\n\n${rightsSummary(connection.rights)}`
+        ? `✅ Automation подключена.\n\n${rightsSummary(connection.rights)}\n\n${giftEngineLine()}`
         : `❌ Активное Automation-подключение не найдено. Отправь /start для инструкции.`
     });
   }
@@ -241,6 +262,7 @@ async function handleNormalMessage(message) {
 
 async function handleBusinessConnection(connection) {
   rememberConnection(connection);
+  catalogSnapshots.delete(connection.id);
 
   console.log('[business_connection]', {
     id: connection.id,
@@ -264,6 +286,386 @@ async function handleBusinessConnection(connection) {
   }
 }
 
+function normalizeSearch(value) {
+  return value
+    .toLocaleLowerCase('ru-RU')
+    .replace(/[ё]/g, 'е')
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
+    .trim();
+}
+
+function isSendableGift(gift) {
+  if (gift.soldOut || gift.auction) return false;
+
+  if (
+    typeof gift.availabilityRemains === 'number' &&
+    gift.availabilityRemains <= 0
+  ) {
+    return false;
+  }
+
+  return true;
+}
+
+function formatGift(gift, index) {
+  const title = gift.title || `Gift ${gift.id}`;
+  const flags = [];
+
+  if (gift.requirePremium) {
+    flags.push('Premium');
+  }
+
+  if (
+    typeof gift.availabilityRemains === 'number' &&
+    typeof gift.availabilityTotal === 'number'
+  ) {
+    flags.push(`${gift.availabilityRemains}/${gift.availabilityTotal}`);
+  }
+
+  if (
+    typeof gift.lockedUntilDate === 'number' &&
+    gift.lockedUntilDate * 1000 > Date.now()
+  ) {
+    flags.push('🔒');
+  }
+
+  return `${index + 1}. ${title} — ${gift.stars} ⭐${flags.length ? ` • ${flags.join(' • ')}` : ''}`;
+}
+
+function pageNumber(value) {
+  if (!value) return 1;
+
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 1) return null;
+
+  return parsed;
+}
+
+async function getBotApiCatalog() {
+  const result = await api('getAvailableGifts');
+
+  return (result?.gifts || []).map(gift => ({
+    id: gift.id,
+    title: gift.sticker?.emoji
+      ? `${gift.sticker.emoji} Gift`
+      : null,
+    stars: gift.star_count,
+    soldOut: false,
+    auction: false,
+    limited: false,
+    availabilityRemains: null,
+    availabilityTotal: null,
+    requirePremium: Boolean(gift.is_premium),
+    lockedUntilDate: null
+  }));
+}
+
+async function loadCatalogForDisplay() {
+  if (isGiftEngineConfigured()) {
+    return getGiftCatalog({ force: true });
+  }
+
+  return getBotApiCatalog();
+}
+
+async function showGiftCatalog(connectionId, chatId, args) {
+  const page = pageNumber(args);
+
+  if (!page) {
+    throw new Error('INVALID_GIFTS_PAGE');
+  }
+
+  const all = await loadCatalogForDisplay();
+  const gifts = all.filter(isSendableGift);
+
+  if (!gifts.length) {
+    throw new Error('NO_AVAILABLE_GIFTS');
+  }
+
+  catalogSnapshots.set(connectionId, {
+    createdAt: Date.now(),
+    gifts: gifts.map(gift => ({ ...gift }))
+  });
+
+  const pageSize = 12;
+  const pages = Math.max(1, Math.ceil(gifts.length / pageSize));
+
+  if (page > pages) {
+    throw new Error(`INVALID_GIFTS_PAGE:${pages}`);
+  }
+
+  const start = (page - 1) * pageSize;
+  const slice = gifts.slice(start, start + pageSize);
+
+  const lines = slice.map(
+    (gift, offset) => formatGift(gift, start + offset)
+  );
+
+  await sendBusinessMessage(
+    connectionId,
+    chatId,
+    `🎁 Доступные Telegram Gifts\n` +
+      `Страница ${page}/${pages}\n\n` +
+      `${lines.join('\n')}\n\n` +
+      `Отправить: .gift <номер или название>` +
+      `${pages > 1 ? `\nСледующая: .gifts ${Math.min(page + 1, pages)}` : ''}` +
+      `${isGiftEngineConfigured() ? '' : '\n\n⚠️ Для реальной покупки добавь TG_API_ID и TG_API_HASH на Render.'}`
+  );
+}
+
+async function showBusinessBalance(connectionId, chatId) {
+  const balance = await api('getBusinessAccountStarBalance', {
+    business_connection_id: connectionId
+  });
+
+  const nanos = Number(balance.nanostar_amount || 0);
+  const decimal = nanos
+    ? String(Math.abs(nanos)).padStart(9, '0').replace(/0+$/, '')
+    : '';
+
+  await sendBusinessMessage(
+    connectionId,
+    chatId,
+    `⭐ Баланс: ${balance.amount}${decimal ? `.${decimal}` : ''} Stars`
+  );
+}
+
+function resolveSnapshotGift(connectionId, selector) {
+  const snapshot = catalogSnapshots.get(connectionId);
+
+  if (!snapshot || Date.now() - snapshot.createdAt > 5 * 60_000) {
+    throw new Error('CATALOG_SNAPSHOT_REQUIRED');
+  }
+
+  const query = selector.trim();
+
+  if (!query) {
+    throw new Error('GIFT_SELECTOR_REQUIRED');
+  }
+
+  if (/^\d+$/.test(query)) {
+    const numeric = Number(query);
+
+    if (
+      Number.isSafeInteger(numeric) &&
+      numeric >= 1 &&
+      numeric <= snapshot.gifts.length
+    ) {
+      return snapshot.gifts[numeric - 1];
+    }
+
+    const byId = snapshot.gifts.find(gift => gift.id === query);
+    if (byId) return byId;
+  }
+
+  const normalized = normalizeSearch(query);
+
+  const exact = snapshot.gifts.filter(
+    gift => gift.title && normalizeSearch(gift.title) === normalized
+  );
+
+  if (exact.length === 1) {
+    return exact[0];
+  }
+
+  const contains = snapshot.gifts.filter(
+    gift =>
+      gift.title &&
+      normalizeSearch(gift.title).includes(normalized)
+  );
+
+  if (contains.length === 1) {
+    return contains[0];
+  }
+
+  if (contains.length > 1 || exact.length > 1) {
+    const matches = (exact.length ? exact : contains)
+      .slice(0, 5)
+      .map(gift => gift.title)
+      .join(', ');
+
+    throw new Error(`GIFT_AMBIGUOUS:${matches}`);
+  }
+
+  throw new Error('GIFT_NOT_FOUND');
+}
+
+async function buyGift({
+  connection,
+  message,
+  selector
+}) {
+  if (!isGiftEngineConfigured()) {
+    throw new Error('GIFTS_ENGINE_NOT_CONFIGURED');
+  }
+
+  if (!connection.rights?.can_view_gifts_and_stars) {
+    throw new Error('RIGHT_VIEW_GIFTS_REQUIRED');
+  }
+
+  if (!connection.rights?.can_transfer_stars) {
+    throw new Error('RIGHT_TRANSFER_STARS_REQUIRED');
+  }
+
+  const selected = resolveSnapshotGift(
+    connection.id,
+    selector
+  );
+
+  const freshCatalog = await getGiftCatalog({ force: true });
+  const fresh = freshCatalog.find(gift => gift.id === selected.id);
+
+  if (!fresh || !isSendableGift(fresh)) {
+    throw new Error('GIFT_NO_LONGER_AVAILABLE');
+  }
+
+  if (fresh.stars !== selected.stars) {
+    throw new Error(
+      `PRICE_CHANGED:${selected.stars}:${fresh.stars}`
+    );
+  }
+
+  if (
+    typeof fresh.lockedUntilDate === 'number' &&
+    fresh.lockedUntilDate * 1000 > Date.now()
+  ) {
+    throw new Error('GIFT_LOCKED');
+  }
+
+  const balance = await api('getBusinessAccountStarBalance', {
+    business_connection_id: connection.id
+  });
+
+  if (Number(balance.amount) < fresh.stars) {
+    throw new Error(
+      `BALANCE_TOO_LOW:${balance.amount}:${fresh.stars}`
+    );
+  }
+
+  await sendGiftFromBusiness({
+    connectionId: connection.id,
+    chatId: message.chat.id,
+    chatUsername: message.chat.username || null,
+    messageId: message.message_id,
+    gift: fresh
+  });
+
+  return fresh;
+}
+
+function friendlyGiftError(error) {
+  const raw = String(
+    error?.telegram?.description ||
+    error?.errorMessage ||
+    error?.message ||
+    error
+  );
+
+  if (raw.startsWith('CATALOG_SNAPSHOT_REQUIRED')) {
+    return 'Сначала отправь .gifts, чтобы увидеть актуальные Gifts и цены.';
+  }
+
+  if (raw.startsWith('GIFT_SELECTOR_REQUIRED')) {
+    return 'Формат: .gift <номер или название>. Сначала посмотри .gifts.';
+  }
+
+  if (raw.startsWith('GIFT_NOT_FOUND')) {
+    return 'Такого Gift нет в показанном каталоге. Обнови список командой .gifts.';
+  }
+
+  if (raw.startsWith('GIFT_AMBIGUOUS:')) {
+    return `Название неоднозначное: ${raw.slice('GIFT_AMBIGUOUS:'.length)}. Используй номер из .gifts.`;
+  }
+
+  if (raw.startsWith('GIFTS_ENGINE_NOT_CONFIGURED')) {
+    return 'Реальная отправка Gifts ещё не включена на сервере: нужны TG_API_ID и TG_API_HASH.';
+  }
+
+  if (raw.startsWith('RIGHT_VIEW_GIFTS_REQUIRED')) {
+    return 'GiftShell не выдано право смотреть Gifts и Stars. Включи его в Автоматизации чатов.';
+  }
+
+  if (raw.startsWith('RIGHT_TRANSFER_STARS_REQUIRED')) {
+    return 'GiftShell не выдано право использовать Stars. Включи передачу Stars в Автоматизации чатов.';
+  }
+
+  if (
+    raw.includes('BALANCE_TOO_LOW') ||
+    raw.startsWith('BALANCE_TOO_LOW:')
+  ) {
+    const parts = raw.split(':');
+
+    if (parts.length >= 3 && Number.isFinite(Number(parts[1]))) {
+      return `Не хватает Stars. Баланс: ${parts[1]} ⭐, Gift стоит ${parts[2]} ⭐.`;
+    }
+
+    return 'Не хватает Telegram Stars для этого Gift.';
+  }
+
+  if (
+    raw.includes('STARGIFT_USAGE_LIMITED') ||
+    raw.startsWith('GIFT_NO_LONGER_AVAILABLE')
+  ) {
+    return 'Этот Gift уже закончился или больше недоступен. Обнови .gifts.';
+  }
+
+  if (raw.includes('STARGIFT_USER_USAGE_LIMITED')) {
+    return 'Telegram не даёт купить ещё один такой Gift: достигнут лимит на пользователя.';
+  }
+
+  if (raw.includes('USER_DISALLOWED_STARGIFTS')) {
+    return 'Получатель запретил этот тип Gifts в настройках.';
+  }
+
+  if (
+    raw.includes('PREMIUM_ACCOUNT_REQUIRED') ||
+    raw.includes('PREMIUM_REQUIRED')
+  ) {
+    return 'Этот Gift доступен только аккаунтам Telegram Premium.';
+  }
+
+  if (raw.startsWith('GIFT_LOCKED')) {
+    return 'Этот Gift пока заблокирован Telegram и ещё не продаётся.';
+  }
+
+  if (
+    raw.includes('STARS_FORM_AMOUNT_MISMATCH') ||
+    raw.startsWith('PRICE_CHANGED:')
+  ) {
+    return 'Цена Gift изменилась. Обнови .gifts перед покупкой.';
+  }
+
+  if (raw.includes('TARGET_PEER_NOT_RESOLVED')) {
+    return 'Не смог получить MTProto-пир получателя. Напиши обычное сообщение в этот чат и повтори .gifts → .gift.';
+  }
+
+  if (
+    raw.includes('BUSINESS_CONNECTION_INVALID') ||
+    raw.includes('BUSINESS_CONNECTION_DISABLED')
+  ) {
+    return 'Automation-подключение изменилось. Переподключи GiftShell в «Автоматизации чатов».';
+  }
+
+  if (
+    raw.includes('FORM_EXPIRED') ||
+    raw.includes('FORM_UNSUPPORTED') ||
+    raw.includes('API_GIFT_RESTRICTED_UPDATE_APP')
+  ) {
+    return 'Telegram отклонил платёжную форму Gift. Обнови .gifts и повтори.';
+  }
+
+  return `Не удалось отправить Gift: ${raw.slice(0, 220)}`;
+}
+
+function rememberSuccessfulPayment(key) {
+  successfulPayments.add(key);
+
+  if (successfulPayments.size > 1000) {
+    const oldest = successfulPayments.values().next().value;
+    successfulPayments.delete(oldest);
+  }
+}
+
 async function handleBusinessMessage(message) {
   const connectionId = message.business_connection_id;
   if (!connectionId || message.sender_business_bot) return;
@@ -272,6 +674,7 @@ async function handleBusinessMessage(message) {
   if (!text) return;
 
   let connection;
+
   try {
     connection = await getConnection(connectionId);
   } catch (error) {
@@ -296,6 +699,7 @@ async function handleBusinessMessage(message) {
   });
 
   let action = null;
+  let financial = false;
 
   if (command.name === 'ping' && !command.args) {
     action = async () => {
@@ -314,7 +718,7 @@ async function handleBusinessMessage(message) {
       await sendBusinessMessage(
         connectionId,
         message.chat.id,
-        `✅ Automation активна.\n\n${rightsSummary(connection.rights)}`
+        `✅ Automation активна.\n\n${rightsSummary(connection.rights)}\n\n${giftEngineLine()}`
       );
     };
   }
@@ -326,8 +730,31 @@ async function handleBusinessMessage(message) {
         message.chat.id,
         `🎁 GiftShell команды\n\n` +
         `.ping — проверить работу\n` +
-        `.status — проверить права Automation\n` +
-        `.gift test — тест механики подарка без списания Stars`
+        `.status — проверить Automation\n` +
+        `.balance — баланс Stars\n` +
+        `.gifts [страница] — актуальные Telegram Gifts\n` +
+        `.gift <номер|название> — купить Gift текущему собеседнику\n` +
+        `.gift test — тест без списания Stars\n\n` +
+        `Перед покупкой сначала используй .gifts: GiftShell сверяет ID и цену повторно прямо перед оплатой.`
+      );
+    };
+  }
+
+  if (command.name === 'balance' && !command.args) {
+    action = async () => {
+      await showBusinessBalance(
+        connectionId,
+        message.chat.id
+      );
+    };
+  }
+
+  if (command.name === 'gifts') {
+    action = async () => {
+      await showGiftCatalog(
+        connectionId,
+        message.chat.id,
+        command.args
       );
     };
   }
@@ -337,36 +764,76 @@ async function handleBusinessMessage(message) {
       await sendBusinessMessage(
         connectionId,
         message.chat.id,
-        '🎁 .gift работает. Это тест: Stars не списываются и подарок не покупается.'
+        '🎁 .gift работает. Это test: Stars не списываются.'
       );
+    };
+  } else if (command.name === 'gift') {
+    financial = true;
+
+    action = async () => {
+      await buyGift({
+        connection,
+        message,
+        selector: command.args
+      });
     };
   }
 
-  // Unknown or malformed dot commands stay untouched.
   if (!action) return;
+
+  const paymentKey = `${connectionId}:${message.chat.id}:${message.message_id}`;
+
+  if (financial) {
+    if (
+      successfulPayments.has(paymentKey) ||
+      paymentLocks.has(paymentKey)
+    ) {
+      return;
+    }
+
+    paymentLocks.add(paymentKey);
+  }
 
   try {
     await action();
+
+    if (financial) {
+      rememberSuccessfulPayment(paymentKey);
+    }
   } catch (error) {
     console.error('[dot command action error]', {
       command: command.name,
-      error: error.message
+      error: error?.errorMessage || error?.message
     });
-    return;
-  }
 
-  // Delete only after successful execution.
-  try {
-    await deleteBusinessCommand(connectionId, message.message_id);
-  } catch (error) {
-    console.error('[delete command error]', error.message);
-
-    // Never repeat the action here. Future commands may spend Stars.
     try {
       await sendBusinessMessage(
         connectionId,
         message.chat.id,
-        '⚠️ Действие выполнено, но команда не удалилась. Проверь право «Удалять все сообщения» в Автоматизации чатов.'
+        `⚠️ ${friendlyGiftError(error)}`
+      );
+    } catch {}
+
+    return;
+  } finally {
+    if (financial) {
+      paymentLocks.delete(paymentKey);
+    }
+  }
+
+  try {
+    await deleteBusinessCommand(
+      connectionId,
+      message.message_id
+    );
+  } catch (error) {
+    console.error('[delete command error]', error.message);
+
+    try {
+      await sendBusinessMessage(
+        connectionId,
+        message.chat.id,
+        '⚠️ Действие выполнено, но команда не удалилась. Проверь право «Удалять все сообщения».'
       );
     } catch {}
   }
@@ -398,6 +865,7 @@ function readJsonBody(req, maxBytes = 1_000_000) {
 
     req.on('data', chunk => {
       raw += chunk;
+
       if (Buffer.byteLength(raw, 'utf8') > maxBytes) {
         reject(new Error('request body too large'));
         req.destroy();
@@ -420,17 +888,22 @@ function startHttpServer() {
   return new Promise((resolve, reject) => {
     httpServer = http.createServer(async (req, res) => {
       if (req.method === 'GET' && (req.url === '/' || req.url === '/health')) {
-        res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+        res.writeHead(200, {
+          'content-type': 'application/json; charset=utf-8'
+        });
+
         res.end(
           JSON.stringify({
             ok: true,
             service: 'GiftShell',
-            version: '0.3.1',
+            version: '0.4.0',
             mode: USE_WEBHOOK ? 'webhook' : 'polling',
             render: IS_RENDER,
-            known_active_connections: activeConnectionByUser.size
+            known_active_connections: activeConnectionByUser.size,
+            real_gifts_enabled: isGiftEngineConfigured()
           })
         );
+
         return;
       }
 
@@ -442,6 +915,7 @@ function startHttpServer() {
         }
 
         const received = req.headers['x-telegram-bot-api-secret-token'];
+
         if (received !== WEBHOOK_SECRET) {
           res.writeHead(403);
           res.end('forbidden');
@@ -451,25 +925,32 @@ function startHttpServer() {
         try {
           const update = await readJsonBody(req);
 
-          res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
+          res.writeHead(200, {
+            'content-type': 'text/plain; charset=utf-8'
+          });
           res.end('ok');
 
           void processUpdate(update);
         } catch (error) {
           console.error('[webhook request]', error.message);
+
           if (!res.headersSent) {
             res.writeHead(400);
             res.end('bad request');
           }
         }
+
         return;
       }
 
-      res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
+      res.writeHead(404, {
+        'content-type': 'text/plain; charset=utf-8'
+      });
       res.end('not found');
     });
 
     httpServer.once('error', reject);
+
     httpServer.listen(PORT, '0.0.0.0', () => {
       console.log(`HTTP server listening on 0.0.0.0:${PORT}`);
       resolve();
@@ -488,6 +969,7 @@ async function configureWebhook() {
   });
 
   const info = await api('getWebhookInfo');
+
   console.log('[webhook ready]', {
     url: info.url,
     pending_update_count: info.pending_update_count,
@@ -496,7 +978,10 @@ async function configureWebhook() {
 }
 
 async function startPolling() {
-  await api('deleteWebhook', { drop_pending_updates: false });
+  await api('deleteWebhook', {
+    drop_pending_updates: false
+  });
+
   console.log('Long polling mode started.');
 
   let offset = 0;
@@ -515,6 +1000,7 @@ async function startPolling() {
       }
     } catch (error) {
       if (shuttingDown) break;
+
       console.error('[polling]', error.message);
       await new Promise(resolve => setTimeout(resolve, 1500));
     }
@@ -523,8 +1009,13 @@ async function startPolling() {
 
 async function gracefulShutdown(signal) {
   if (shuttingDown) return;
+
   shuttingDown = true;
   console.log(`[shutdown] ${signal}`);
+
+  try {
+    await closeGiftEngine();
+  } catch {}
 
   if (httpServer) {
     await new Promise(resolve => httpServer.close(resolve));
@@ -540,8 +1031,18 @@ async function bootstrap() {
   console.log(`can_connect_to_business = ${Boolean(me.can_connect_to_business)}`);
   console.log(`runtime = ${IS_RENDER ? 'Render' : 'local/other'}`);
   console.log(`mode = ${USE_WEBHOOK ? 'webhook' : 'long polling'}`);
+  console.log(`real_gifts_enabled = ${isGiftEngineConfigured()}`);
 
   await bootstrapKnownConnections();
+
+  try {
+    await primeGiftEngine(KNOWN_CONNECTION_IDS);
+  } catch (error) {
+    console.warn(
+      '[gift engine startup failed]',
+      error?.errorMessage || error?.message
+    );
+  }
 
   await api('setMyCommands', {
     commands: [
