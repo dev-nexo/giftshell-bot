@@ -44,6 +44,36 @@ const catalogSnapshots = new Map();
 const paymentLocks = new Set();
 const successfulPayments = new Set();
 
+const mutedBusinessChats = new Set();
+
+function mutedBusinessChatKey(connectionId, chatId) {
+  return `${connectionId}:${chatId}`;
+}
+
+function isBusinessChatMuted(connectionId, chatId) {
+  return mutedBusinessChats.has(
+    mutedBusinessChatKey(connectionId, chatId)
+  );
+}
+
+function setBusinessChatMuted(
+  connectionId,
+  chatId,
+  muted
+) {
+  const key = mutedBusinessChatKey(
+    connectionId,
+    chatId
+  );
+
+  if (muted) {
+    mutedBusinessChats.add(key);
+  } else {
+    mutedBusinessChats.delete(key);
+  }
+}
+
+
 const catalogUiByChat = new Map();
 
 function catalogUiKey(connectionId, chatId) {
@@ -873,9 +903,6 @@ async function handleBusinessMessage(message) {
   const connectionId = message.business_connection_id;
   if (!connectionId || message.sender_business_bot) return;
 
-  const text = message.text?.trim();
-  if (!text) return;
-
   let connection;
 
   try {
@@ -886,9 +913,47 @@ async function handleBusinessMessage(message) {
   }
 
   const ownerId = connection.user?.id;
-  if (!ownerId || message.from?.id !== ownerId) return;
+  if (!ownerId) return;
+
+  const isOwner = message.from?.id === ownerId;
+
+  // Telegram doesn't expose a private-chat restriction like a
+  // supergroup mute through Business Bot API. Our .mute therefore
+  // acts as a hard filter: incoming peer messages are revoked
+  // immediately while this chat is muted.
+  if (!isOwner) {
+    if (
+      isBusinessChatMuted(
+        connectionId,
+        message.chat.id
+      )
+    ) {
+      try {
+        await safeDeleteBusinessMessages(
+          connectionId,
+          [message.message_id]
+        );
+
+        console.log('[muted peer message deleted]', {
+          chat_id: message.chat.id,
+          from_id: message.from?.id,
+          message_id: message.message_id
+        });
+      } catch (error) {
+        console.error(
+          '[mute delete failed]',
+          error.message
+        );
+      }
+    }
+
+    return;
+  }
 
   activeConnectionByUser.set(ownerId, connectionId);
+
+  const text = message.text?.trim();
+  if (!text) return;
 
   const command = parseDotCommand(text);
   if (!command) return;
@@ -903,6 +968,46 @@ async function handleBusinessMessage(message) {
 
   let action = null;
   let financial = false;
+
+
+  if (command.name === 'mute' && !command.args) {
+    action = async () => {
+      setBusinessChatMuted(
+        connectionId,
+        message.chat.id,
+        true
+      );
+
+      await clearCatalogUi(
+        connectionId,
+        message.chat.id
+      );
+
+      await sendEphemeralBusinessMessage(
+        connectionId,
+        message.chat.id,
+        '🔇 Mute включён. Новые сообщения собеседника будут сразу удаляться.',
+        7000
+      );
+    };
+  }
+
+  if (command.name === 'unmute' && !command.args) {
+    action = async () => {
+      setBusinessChatMuted(
+        connectionId,
+        message.chat.id,
+        false
+      );
+
+      await sendEphemeralBusinessMessage(
+        connectionId,
+        message.chat.id,
+        '🔊 Mute выключен. Сообщения собеседника снова остаются в чате.',
+        7000
+      );
+    };
+  }
 
   if (command.name === 'ping' && !command.args) {
     action = async () => {
@@ -939,7 +1044,9 @@ async function handleBusinessMessage(message) {
         `.balance — баланс Stars\n` +
         `.gifts [страница] — актуальные Telegram Gifts\n` +
         `.gift <номер|название> — купить Gift текущему собеседнику\n` +
-        `.gift test — тест без списания Stars\n\n` +
+        `.gift test — тест без списания Stars\n` +
+        `.mute — удалять новые сообщения собеседника\n` +
+        `.unmute — снова принимать сообщения собеседника\n\n` +
         `Каталог живёт 90 секунд и заменяется, а не спамит новыми сообщениями.`,
         30000
       );
