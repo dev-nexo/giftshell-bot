@@ -1,6 +1,6 @@
 import bigInt from 'big-integer';
 import { Api, TelegramClient } from 'teleproto';
-import { StringSession } from 'teleproto/sessions';
+import { StringSession } from 'teleproto/sessions/index.js';
 
 const BOT_TOKEN = process.env.BOT_TOKEN?.trim();
 const TG_API_ID = Number(process.env.TG_API_ID || 0);
