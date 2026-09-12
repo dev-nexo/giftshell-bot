@@ -350,6 +350,7 @@ async function getBotApiCatalog() {
       ? `${gift.sticker.emoji} Gift`
       : null,
     stickerFileId: gift.sticker?.file_id || null,
+    stickerThumbnailFileId: gift.sticker?.thumbnail?.file_id || null,
     stickerEmoji: gift.sticker?.emoji || null,
     stars: gift.star_count,
     soldOut: false,
@@ -379,33 +380,41 @@ async function sendGiftPreviewSticker(
   const label =
     `№${number} • ${gift.stars} ⭐ • скопировать ${command}`;
 
-  if (!gift.stickerFileId) {
-    await sendBusinessMessage(
-      connectionId,
-      chatId,
-      `${number}. ${gift.stickerEmoji || '🎁'} — ${gift.stars} ⭐\n${command}`
-    );
-    return;
+  if (gift.stickerThumbnailFileId) {
+    try {
+      await api('sendPhoto', {
+        business_connection_id: connectionId,
+        chat_id: chatId,
+        photo: gift.stickerThumbnailFileId,
+        caption: `${gift.stickerEmoji || '🎁'} №${number} • ${gift.stars} ⭐`,
+        disable_notification: true,
+        reply_markup: {
+          inline_keyboard: [
+            [
+              {
+                text: label,
+                copy_text: {
+                  text: command
+                }
+              }
+            ]
+          ]
+        }
+      });
+      return;
+    } catch (error) {
+      console.warn('[gift preview photo fallback]', {
+        gift_id: gift.id,
+        error: error.message
+      });
+    }
   }
 
-  await api('sendSticker', {
-    business_connection_id: connectionId,
-    chat_id: chatId,
-    sticker: gift.stickerFileId,
-    disable_notification: true,
-    reply_markup: {
-      inline_keyboard: [
-        [
-          {
-            text: label,
-            copy_text: {
-              text: command
-            }
-          }
-        ]
-      ]
-    }
-  });
+  await sendBusinessMessage(
+    connectionId,
+    chatId,
+    `${number}. ${gift.stickerEmoji || '🎁'} Gift — ${gift.stars} ⭐\n${command}`
+  );
 }
 
 async function showGiftCatalog(connectionId, chatId, args) {
