@@ -349,6 +349,8 @@ async function getBotApiCatalog() {
     title: gift.sticker?.emoji
       ? `${gift.sticker.emoji} Gift`
       : null,
+    stickerFileId: gift.sticker?.file_id || null,
+    stickerEmoji: gift.sticker?.emoji || null,
     stars: gift.star_count,
     soldOut: false,
     auction: false,
@@ -361,11 +363,49 @@ async function getBotApiCatalog() {
 }
 
 async function loadCatalogForDisplay() {
-  if (isGiftEngineConfigured()) {
-    return getGiftCatalog({ force: true });
+  // Bot API Gift objects include a reusable sticker file_id.
+  // Use that catalog for the visual picker, then re-check ID/price
+  // against MTProto immediately before a real purchase.
+  return getBotApiCatalog();
+}
+
+async function sendGiftPreviewSticker(
+  connectionId,
+  chatId,
+  gift,
+  number
+) {
+  const command = `.gift ${number}`;
+  const label =
+    `№${number} • ${gift.stars} ⭐ • скопировать ${command}`;
+
+  if (!gift.stickerFileId) {
+    await sendBusinessMessage(
+      connectionId,
+      chatId,
+      `${number}. ${gift.stickerEmoji || '🎁'} — ${gift.stars} ⭐\n${command}`
+    );
+    return;
   }
 
-  return getBotApiCatalog();
+  await api('sendSticker', {
+    business_connection_id: connectionId,
+    chat_id: chatId,
+    sticker: gift.stickerFileId,
+    disable_notification: true,
+    reply_markup: {
+      inline_keyboard: [
+        [
+          {
+            text: label,
+            copy_text: {
+              text: command
+            }
+          }
+        ]
+      ]
+    }
+  });
 }
 
 async function showGiftCatalog(connectionId, chatId, args) {
@@ -387,7 +427,7 @@ async function showGiftCatalog(connectionId, chatId, args) {
     gifts: gifts.map(gift => ({ ...gift }))
   });
 
-  const pageSize = 12;
+  const pageSize = 6;
   const pages = Math.max(1, Math.ceil(gifts.length / pageSize));
 
   if (page > pages) {
@@ -397,19 +437,42 @@ async function showGiftCatalog(connectionId, chatId, args) {
   const start = (page - 1) * pageSize;
   const slice = gifts.slice(start, start + pageSize);
 
-  const lines = slice.map(
-    (gift, offset) => formatGift(gift, start + offset)
+  await sendBusinessMessage(
+    connectionId,
+    chatId,
+    `🎁 Telegram Gifts • ${page}/${pages}\n\n` +
+      `Ниже реальные превью подарков. ` +
+      `Под каждым есть номер, цена и кнопка, которая копирует команду .gift N.`
   );
+
+  for (let offset = 0; offset < slice.length; offset += 1) {
+    const gift = slice[offset];
+    const number = start + offset + 1;
+
+    await sendGiftPreviewSticker(
+      connectionId,
+      chatId,
+      gift,
+      number
+    );
+  }
+
+  const nav = [];
+
+  if (page > 1) {
+    nav.push(`Назад: .gifts ${page - 1}`);
+  }
+
+  if (page < pages) {
+    nav.push(`Дальше: .gifts ${page + 1}`);
+  }
+
+  nav.push('Отправить: .gift <номер>');
 
   await sendBusinessMessage(
     connectionId,
     chatId,
-    `🎁 Доступные Telegram Gifts\n` +
-      `Страница ${page}/${pages}\n\n` +
-      `${lines.join('\n')}\n\n` +
-      `Отправить: .gift <номер или название>` +
-      `${pages > 1 ? `\nСледующая: .gifts ${Math.min(page + 1, pages)}` : ''}` +
-      `${isGiftEngineConfigured() ? '' : '\n\n⚠️ Для реальной покупки добавь TG_API_ID и TG_API_HASH на Render.'}`
+    nav.join('\n')
   );
 }
 
