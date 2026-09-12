@@ -503,9 +503,6 @@ async function buyGift({
     throw new Error('RIGHT_VIEW_GIFTS_REQUIRED');
   }
 
-  if (!connection.rights?.can_transfer_stars) {
-    throw new Error('RIGHT_TRANSFER_STARS_REQUIRED');
-  }
 
   const selected = resolveSnapshotGift(
     connection.id,

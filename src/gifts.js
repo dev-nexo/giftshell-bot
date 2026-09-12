@@ -55,7 +55,7 @@ async function getClient() {
       );
 
       await client.start({
-        botToken: BOT_TOKEN
+        botAuthToken: BOT_TOKEN
       });
 
       client.addEventHandler(update => {
