@@ -44,6 +44,122 @@ const catalogSnapshots = new Map();
 const paymentLocks = new Set();
 const successfulPayments = new Set();
 
+const catalogUiByChat = new Map();
+
+function catalogUiKey(connectionId, chatId) {
+  return `${connectionId}:${chatId}`;
+}
+
+async function safeDeleteBusinessMessages(connectionId, messageIds) {
+  const ids = [...new Set(messageIds.filter(Boolean))].slice(0, 100);
+  if (!ids.length) return;
+
+  try {
+    await api('deleteBusinessMessages', {
+      business_connection_id: connectionId,
+      message_ids: ids
+    });
+  } catch (error) {
+    console.warn('[delete business messages skipped]', error.message);
+  }
+}
+
+async function sendEphemeralBusinessMessage(
+  connectionId,
+  chatId,
+  text,
+  ttlMs = 10000,
+  extra = {}
+) {
+  const sent = await sendBusinessMessage(
+    connectionId,
+    chatId,
+    text,
+    extra
+  );
+
+  if (sent?.message_id && ttlMs > 0) {
+    const timer = setTimeout(() => {
+      void safeDeleteBusinessMessages(
+        connectionId,
+        [sent.message_id]
+      );
+    }, ttlMs);
+
+    timer.unref?.();
+  }
+
+  return sent;
+}
+
+async function clearCatalogUi(connectionId, chatId) {
+  const key = catalogUiKey(connectionId, chatId);
+  const current = catalogUiByChat.get(key);
+
+  if (!current) return;
+
+  if (current.timer) {
+    clearTimeout(current.timer);
+  }
+
+  catalogUiByChat.delete(key);
+
+  await safeDeleteBusinessMessages(
+    connectionId,
+    [current.messageId]
+  );
+}
+
+function rememberCatalogUi(
+  connectionId,
+  chatId,
+  messageId,
+  ttlMs = 90000
+) {
+  const key = catalogUiKey(connectionId, chatId);
+  const previous = catalogUiByChat.get(key);
+
+  if (previous?.timer) {
+    clearTimeout(previous.timer);
+  }
+
+  const timer = setTimeout(() => {
+    const current = catalogUiByChat.get(key);
+
+    if (current?.messageId === messageId) {
+      catalogUiByChat.delete(key);
+      void safeDeleteBusinessMessages(
+        connectionId,
+        [messageId]
+      );
+    }
+  }, ttlMs);
+
+  timer.unref?.();
+
+  catalogUiByChat.set(key, {
+    messageId,
+    timer
+  });
+}
+
+async function editBusinessMessage(
+  connectionId,
+  chatId,
+  messageId,
+  text,
+  replyMarkup
+) {
+  return api('editMessageText', {
+    business_connection_id: connectionId,
+    chat_id: chatId,
+    message_id: messageId,
+    text,
+    reply_markup: replyMarkup
+  });
+}
+
+
 let httpServer;
 let shuttingDown = false;
 
@@ -341,6 +457,7 @@ function pageNumber(value) {
   return parsed;
 }
 
+
 async function getBotApiCatalog() {
   const result = await api('getAvailableGifts');
 
@@ -349,9 +466,7 @@ async function getBotApiCatalog() {
     title: gift.sticker?.emoji
       ? `${gift.sticker.emoji} Gift`
       : null,
-    stickerFileId: gift.sticker?.file_id || null,
-    stickerThumbnailFileId: gift.sticker?.thumbnail?.file_id || null,
-    stickerEmoji: gift.sticker?.emoji || null,
+    stickerEmoji: gift.sticker?.emoji || '🎁',
     stars: gift.star_count,
     soldOut: false,
     auction: false,
@@ -364,57 +479,38 @@ async function getBotApiCatalog() {
 }
 
 async function loadCatalogForDisplay() {
-  // Bot API Gift objects include a reusable sticker file_id.
-  // Use that catalog for the visual picker, then re-check ID/price
-  // against MTProto immediately before a real purchase.
   return getBotApiCatalog();
 }
 
-async function sendGiftPreviewSticker(
-  connectionId,
-  chatId,
-  gift,
-  number
-) {
-  const command = `.gift ${number}`;
-  const label =
-    `№${number} • ${gift.stars} ⭐ • скопировать ${command}`;
+function giftPickerMarkup(gifts, startIndex) {
+  const rows = [];
 
-  if (gift.stickerThumbnailFileId) {
-    try {
-      await api('sendPhoto', {
-        business_connection_id: connectionId,
-        chat_id: chatId,
-        photo: gift.stickerThumbnailFileId,
-        caption: `${gift.stickerEmoji || '🎁'} №${number} • ${gift.stars} ⭐`,
-        disable_notification: true,
-        reply_markup: {
-          inline_keyboard: [
-            [
-              {
-                text: label,
-                copy_text: {
-                  text: command
-                }
-              }
-            ]
-          ]
+  for (let offset = 0; offset < gifts.length; offset += 2) {
+    const row = [];
+
+    for (
+      let inner = offset;
+      inner < Math.min(offset + 2, gifts.length);
+      inner += 1
+    ) {
+      const gift = gifts[inner];
+      const number = startIndex + inner + 1;
+      const command = `.gift ${number}`;
+
+      row.push({
+        text: `${number} ${gift.stickerEmoji} ${gift.stars}⭐`,
+        copy_text: {
+          text: command
         }
       });
-      return;
-    } catch (error) {
-      console.warn('[gift preview photo fallback]', {
-        gift_id: gift.id,
-        error: error.message
-      });
     }
+
+    rows.push(row);
   }
 
-  await sendBusinessMessage(
-    connectionId,
-    chatId,
-    `${number}. ${gift.stickerEmoji || '🎁'} Gift — ${gift.stars} ⭐\n${command}`
-  );
+  return {
+    inline_keyboard: rows
+  };
 }
 
 async function showGiftCatalog(connectionId, chatId, args) {
@@ -436,7 +532,7 @@ async function showGiftCatalog(connectionId, chatId, args) {
     gifts: gifts.map(gift => ({ ...gift }))
   });
 
-  const pageSize = 6;
+  const pageSize = 12;
   const pages = Math.max(1, Math.ceil(gifts.length / pageSize));
 
   if (page > pages) {
@@ -446,43 +542,72 @@ async function showGiftCatalog(connectionId, chatId, args) {
   const start = (page - 1) * pageSize;
   const slice = gifts.slice(start, start + pageSize);
 
-  await sendBusinessMessage(
-    connectionId,
-    chatId,
-    `🎁 Telegram Gifts • ${page}/${pages}\n\n` +
-      `Ниже реальные превью подарков. ` +
-      `Под каждым есть номер, цена и кнопка, которая копирует команду .gift N.`
-  );
-
-  for (let offset = 0; offset < slice.length; offset += 1) {
-    const gift = slice[offset];
+  const lines = slice.map((gift, offset) => {
     const number = start + offset + 1;
-
-    await sendGiftPreviewSticker(
-      connectionId,
-      chatId,
-      gift,
-      number
-    );
-  }
+    return `${number}. ${gift.stickerEmoji} — ${gift.stars} ⭐`;
+  });
 
   const nav = [];
 
-  if (page > 1) {
-    nav.push(`Назад: .gifts ${page - 1}`);
+  if (pages > 1) {
+    if (page > 1) {
+      nav.push(`← .gifts ${page - 1}`);
+    }
+
+    if (page < pages) {
+      nav.push(`.gifts ${page + 1} →`);
+    }
   }
 
-  if (page < pages) {
-    nav.push(`Дальше: .gifts ${page + 1}`);
+  const text =
+    `🎁 Telegram Gifts${pages > 1 ? ` • ${page}/${pages}` : ''}\n\n` +
+    `${lines.join('\n')}\n\n` +
+    `Нажми кнопку снизу, Telegram скопирует команду .gift N.` +
+    `${nav.length ? `\n${nav.join('   ')}` : ''}`;
+
+  const markup = giftPickerMarkup(slice, start);
+  const key = catalogUiKey(connectionId, chatId);
+  const current = catalogUiByChat.get(key);
+
+  if (current?.messageId) {
+    try {
+      const edited = await editBusinessMessage(
+        connectionId,
+        chatId,
+        current.messageId,
+        text,
+        markup
+      );
+
+      rememberCatalogUi(
+        connectionId,
+        chatId,
+        edited.message_id || current.messageId
+      );
+
+      return;
+    } catch (error) {
+      console.warn('[catalog edit fallback]', error.message);
+      await clearCatalogUi(connectionId, chatId);
+    }
   }
 
-  nav.push('Отправить: .gift <номер>');
-
-  await sendBusinessMessage(
+  const sent = await sendBusinessMessage(
     connectionId,
     chatId,
-    nav.join('\n')
+    text,
+    {
+      reply_markup: markup
+    }
   );
+
+  if (sent?.message_id) {
+    rememberCatalogUi(
+      connectionId,
+      chatId,
+      sent.message_id
+    );
+  }
 }
 
 async function showBusinessBalance(connectionId, chatId) {
@@ -716,6 +841,15 @@ function friendlyGiftError(error) {
   }
 
   if (
+    raw.includes('TIMEOUT') ||
+    raw.includes('CONNECTION') ||
+    raw.includes('NETWORK') ||
+    raw.includes('RPC_CALL_FAIL')
+  ) {
+    return 'Не удалось подтвердить итог отправки. Не повторяй .gift сразу: сначала проверь баланс Stars и подарки получателя.';
+  }
+
+  if (
     raw.includes('FORM_EXPIRED') ||
     raw.includes('FORM_UNSUPPORTED') ||
     raw.includes('API_GIFT_RESTRICTED_UPDATE_APP')
@@ -772,10 +906,11 @@ async function handleBusinessMessage(message) {
 
   if (command.name === 'ping' && !command.args) {
     action = async () => {
-      await sendBusinessMessage(
+      await sendEphemeralBusinessMessage(
         connectionId,
         message.chat.id,
-        '✅ GiftShell работает.'
+        '✅ GiftShell работает.',
+        5000
       );
     };
   }
@@ -784,17 +919,18 @@ async function handleBusinessMessage(message) {
     action = async () => {
       connection = await getConnection(connectionId, true);
 
-      await sendBusinessMessage(
+      await sendEphemeralBusinessMessage(
         connectionId,
         message.chat.id,
-        `✅ Automation активна.\n\n${rightsSummary(connection.rights)}\n\n${giftEngineLine()}`
+        `✅ Automation активна.\n\n${rightsSummary(connection.rights)}\n\n${giftEngineLine()}`,
+        15000
       );
     };
   }
 
   if (command.name === 'help' && !command.args) {
     action = async () => {
-      await sendBusinessMessage(
+      await sendEphemeralBusinessMessage(
         connectionId,
         message.chat.id,
         `🎁 GiftShell команды\n\n` +
@@ -804,16 +940,28 @@ async function handleBusinessMessage(message) {
         `.gifts [страница] — актуальные Telegram Gifts\n` +
         `.gift <номер|название> — купить Gift текущему собеседнику\n` +
         `.gift test — тест без списания Stars\n\n` +
-        `Перед покупкой сначала используй .gifts: GiftShell сверяет ID и цену повторно прямо перед оплатой.`
+        `Каталог живёт 90 секунд и заменяется, а не спамит новыми сообщениями.`,
+        30000
       );
     };
   }
 
   if (command.name === 'balance' && !command.args) {
     action = async () => {
-      await showBusinessBalance(
+      const balance = await api('getBusinessAccountStarBalance', {
+        business_connection_id: connectionId
+      });
+
+      const nanos = Number(balance.nanostar_amount || 0);
+      const decimal = nanos
+        ? String(Math.abs(nanos)).padStart(9, '0').replace(/0+$/, '')
+        : '';
+
+      await sendEphemeralBusinessMessage(
         connectionId,
-        message.chat.id
+        message.chat.id,
+        `⭐ Баланс: ${balance.amount}${decimal ? `.${decimal}` : ''} Stars`,
+        10000
       );
     };
   }
@@ -830,10 +978,11 @@ async function handleBusinessMessage(message) {
 
   if (command.name === 'gift' && command.args.toLowerCase() === 'test') {
     action = async () => {
-      await sendBusinessMessage(
+      await sendEphemeralBusinessMessage(
         connectionId,
         message.chat.id,
-        '🎁 .gift работает. Это test: Stars не списываются.'
+        '🎁 .gift работает. Это test: Stars не списываются.',
+        7000
       );
     };
   } else if (command.name === 'gift') {
@@ -875,19 +1024,41 @@ async function handleBusinessMessage(message) {
       error: error?.errorMessage || error?.message
     });
 
+    if (financial) {
+      await clearCatalogUi(
+        connectionId,
+        message.chat.id
+      );
+    }
+
     try {
-      await sendBusinessMessage(
+      await sendEphemeralBusinessMessage(
         connectionId,
         message.chat.id,
-        `⚠️ ${friendlyGiftError(error)}`
+        `⚠️ ${friendlyGiftError(error)}`,
+        12000
       );
     } catch {}
+
+    // The command was valid and handled, so remove it even when the
+    // action failed. Unknown/malformed commands are still left alone.
+    await safeDeleteBusinessMessages(
+      connectionId,
+      [message.message_id]
+    );
 
     return;
   } finally {
     if (financial) {
       paymentLocks.delete(paymentKey);
     }
+  }
+
+  if (financial) {
+    await clearCatalogUi(
+      connectionId,
+      message.chat.id
+    );
   }
 
   try {
